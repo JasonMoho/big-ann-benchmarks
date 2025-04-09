@@ -1,0 +1,28 @@
+dataset: "random-2d"
+
+# Workload output folder
+workload_dir: "workload/demo2d_clustered_drift"
+
+# Distance metric: "l2" or "ip"
+metric: "l2"
+
+# Operation ratios (insert + delete + query must equal 1.0)
+insert_ratio: 0.5
+delete_ratio: 0.25
+query_ratio: 0.25
+
+# Batch sizes for update and query operations
+update_batch_size: 100
+query_batch_size: 10
+
+# Number of operations to generate and size of the initial resident set
+num_operations: 1000
+initial_size: 1000
+
+# Sampling parameters
+cluster_size: 100
+update_sample_distribution: "clustered_drift"
+query_sample_distribution: "clustered_drift"
+
+# Random seed for reproducibility
+seed: 1738

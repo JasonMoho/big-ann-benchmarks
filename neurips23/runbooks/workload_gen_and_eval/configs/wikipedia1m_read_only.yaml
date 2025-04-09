@@ -1,0 +1,37 @@
+# Example configuration for Streaming Workload Generation and Evaluation
+
+# If provided, the dataset will be loaded from benchmark.datasets.
+# Possible dataset names must exist in the DATASETS dict.
+dataset: "wikipedia-1M"
+
+# Workload output folder
+workload_dir: "workload/wiki1m_read_only"
+
+# Distance metric: "l2" or "ip"
+metric: "l2"
+
+# Operation ratios (insert + delete + query must equal 1.0)
+insert_ratio: 0.9
+delete_ratio: 0.0
+query_ratio: 0.1
+
+# Batch sizes for update and query operations
+update_batch_size: 10000
+query_batch_size: 50
+
+# Number of operations to generate and size of the initial resident set
+num_operations: 1000
+initial_size: 10000
+
+# Clustering parameters for stratified sampling
+cluster_size: 100
+update_sample_distribution: "uniform"
+query_sample_distribution: "uniform"
+
+# Random seed for reproducibility
+seed: 1738
+
+# When using dataset mode, the base vectors and queries are loaded from the dataset.
+# Otherwise, you could specify file paths:
+# base_vectors_file: "path/to/base_vectors.npy"
+# queries_file: "path/to/query_vectors.npy"

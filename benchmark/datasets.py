@@ -1313,6 +1313,7 @@ DATASETS = {
     'openai-2M': lambda : OpenAIArXivDataset(2321096),
     'openai-100K': lambda : OpenAIArXivDataset(100000),
 
+    'random-2d': lambda : RandomDS(10000, 1000, 2),
     'random-xs': lambda : RandomDS(10000, 1000, 20),
     'random-s': lambda : RandomDS(100000, 1000, 50),
 
