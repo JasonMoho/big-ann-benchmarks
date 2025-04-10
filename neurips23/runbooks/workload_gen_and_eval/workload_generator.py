@@ -12,8 +12,9 @@ folder. A runbook is recorded and saved in both JSON and YAML. Ground truth for
 each query operation is computed immediately using Faiss, and timing information
 is recorded in the runbook.
 
+Run from the repo root directory with:
 Usage:
-  python neurips23/streaming/workload_generator.py --config config.yaml [--verbose]
+  python3 -m neurips23.streaming.workload_generator --config config.yaml [--verbose]
 """
 
 import argparse
@@ -22,7 +23,7 @@ import logging
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import yaml
@@ -35,7 +36,7 @@ DEFAULT_WORKLOAD_DIR = "workload"
 DEFAULT_METRIC = "l2"
 DEFAULT_INSERT_RATIO = 0.5
 DEFAULT_DELETE_RATIO = 0.0
-DEFAULT_QUERY_RATIO = 0.5  # Must add to 1.0.
+DEFAULT_QUERY_RATIO = 0.5  # Sum must equal 1.0.
 DEFAULT_UPDATE_BATCH_SIZE = 100
 DEFAULT_QUERY_BATCH_SIZE = 50
 DEFAULT_NUM_OPERATIONS = 1000
@@ -50,14 +51,17 @@ VALID_SAMPLE_DISTRIBUTIONS = ["uniform", "clustered_drift", "clustered_random"]
 
 logger = logging.getLogger("WorkloadGenerator")
 
+
 def load_yaml_config(config_path: Union[str, Path]) -> Dict[str, Any]:
+    """Load YAML configuration file from the given path."""
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
 
-def load_dataset_from_name(dataset_name: str) -> (np.ndarray, Optional[np.ndarray]):
+def load_dataset_from_name(dataset_name: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Load a dataset using the provided dataset name from benchmark.datasets."""
     ds = DATASETS[dataset_name]()
-    base_vectors = ds.get_dataset()  # Expects a NumPy array
+    base_vectors = ds.get_dataset()  # Expected to be a NumPy array.
     queries = ds.get_queries() if hasattr(ds, "get_queries") else None
     return base_vectors, queries
 
@@ -67,11 +71,12 @@ class UniformSampler:
 
     @staticmethod
     def sample(pool: np.ndarray, size: int) -> np.ndarray:
+        """Return a uniform random sample of indices from the given pool."""
         if pool.size == 0:
             return np.array([], dtype=int)
-        size = min(size, pool.size)
+        sample_size = min(size, pool.size)
         perm = np.random.permutation(pool.size)
-        return pool[perm[:size]]
+        return pool[perm[:sample_size]]
 
 
 class StratifiedClusterSampler:
@@ -88,8 +93,8 @@ class StratifiedClusterSampler:
         self.assignments = assignments
         self.centroids = centroids
         self.n_clusters = centroids.shape[0]
-        unique = np.unique(assignments)
-        self.root_cluster = int(np.random.choice(unique))
+        unique_clusters = np.unique(assignments)
+        self.root_cluster = int(np.random.choice(unique_clusters))
         self.cluster_ranks = self._compute_cluster_ranks(self.root_cluster)
 
         self.upper_random = self.n_clusters
@@ -102,40 +107,50 @@ class StratifiedClusterSampler:
             raise ValueError(f"Invalid sample distribution: {sample_distribution}")
 
     def _compute_cluster_ranks(self, root_cluster: int) -> np.ndarray:
+        """Compute cluster ranks based on distance from the root cluster centroid."""
         root = self.centroids[root_cluster]
         distances = np.linalg.norm(self.centroids - root, axis=1)
         return np.argsort(distances)
 
-    def update_ranks(self, new_root: int = -1) -> None:
+    def update_ranks(self, new_root: int) -> None:
+        """Update cluster ranks, optionally selecting a new root cluster."""
         logger.debug("Updating cluster ranks; new root: %d", new_root)
-
-        # select random if not given
-        if new_root == -1:
-            new_root = np.random.randint(0, self.n_clusters, 1)
-
         self.root_cluster = new_root
         self.cluster_ranks = self._compute_cluster_ranks(new_root)
 
     def sample(self, pool: np.ndarray, size: int, update_ranks: bool = True) -> np.ndarray:
+        """
+        Sample indices from the pool based on stratified cluster assignments.
+
+        Parameters:
+            pool: Available indices to sample from.
+            size: Number of indices to sample.
+            update_ranks: Whether to update cluster rankings after sampling.
+
+        Returns:
+            Unique indices sampled from the pool.
+        """
         pool_clusters = self.assignments[pool]
-        ordered = [c for c in self.cluster_ranks if c in np.unique(pool_clusters)]
-        collected: List[np.ndarray] = []
+        unique_clusters_in_pool = np.unique(pool_clusters) # get clusters that are present in the sample pool
+        ordered_clusters = [c for c in self.cluster_ranks if c in unique_clusters_in_pool]
+        collected_samples: List[np.ndarray] = []
         num_collected = 0
-        for cluster in ordered:
-            indices = pool[pool_clusters == cluster]
-            if indices.size == 0:
+        for cluster in ordered_clusters:
+            cluster_indices = pool[pool_clusters == cluster]
+            if cluster_indices.size == 0:
                 continue
-            n_to_sample = min(size - num_collected, indices.size)
-            sampled = UniformSampler.sample(indices, n_to_sample)
-            collected.append(sampled)
+            n_to_sample = min(size - num_collected, cluster_indices.size)
+            sampled = UniformSampler.sample(cluster_indices, n_to_sample)
+            collected_samples.append(sampled)
             num_collected += sampled.size
             if num_collected >= size:
                 break
-        result = np.concatenate(collected) if collected else np.array([], dtype=int)
-        if update_ranks and len(ordered) > 1 and not self.fixed_ranks:
-            high = min(len(ordered), self.upper_random)
-            self.update_ranks(ordered[np.random.randint(1, high, 1)[0]])
+        result = np.concatenate(collected_samples) if collected_samples else np.array([], dtype=int)
+        if update_ranks and len(ordered_clusters) > 1 and not self.fixed_ranks:
+            high = min(len(ordered_clusters), self.upper_random)
+            self.update_ranks(ordered_clusters[np.random.randint(1, high)])
         return np.unique(result)
+
 
 class DynamicWorkloadGenerator:
     """
@@ -143,14 +158,11 @@ class DynamicWorkloadGenerator:
 
     Process:
       1. Load dataset (by name or from file paths).
-      2. Cluster the base vectors using Faiss (or reuse saved clustering).
-         Clustering is saved to <workload_dir>/clustered_index.npy.
+      2. Cluster the base vectors using Faiss.
       3. Sample an initial resident set.
-      4. Generate operations (insert, delete, query) saved as .npy files.
-      5. For each query op, compute ground truth on the currently resident vectors.
-      6. Save a runbook (JSON and YAML) that records operation info and timing.
-
-    INFO-level logs show a one-line summary per operation.
+      4. Generate operations (insert, delete, query) and save them as .npy files.
+      5. Compute ground truth for query operations.
+      6. Save a runbook with parameters, operation details, and timings.
     """
 
     def __init__(
@@ -186,28 +198,30 @@ class DynamicWorkloadGenerator:
         self.update_sample_distribution = update_sample_distribution.lower()
         self.query_sample_distribution = query_sample_distribution.lower()
         self.seed = seed
-        # Default clustering file path if not provided.
+
         if initial_clustering_path:
             self.initial_clustering_path = Path(initial_clustering_path)
         else:
             self.initial_clustering_path = self.workload_dir / "clustered_index.npy"
 
-        # Load dataset by name or file.
+        # Load dataset by name or from provided file paths.
         if dataset:
-            base_vectors, queries = load_dataset_from_name(dataset)
+            self.base_vectors, self.queries = load_dataset_from_name(dataset)
         else:
             if base_vectors_file is None:
                 raise ValueError("Either 'dataset' or 'base_vectors_file' must be provided in the config.")
-            base_vectors = np.load(base_vectors_file)
-            queries = np.load(queries_file) if queries_file else None
-        self.base_vectors = base_vectors
-        self.queries = queries
+            self.base_vectors = np.load(base_vectors_file)
+            self.queries = np.load(queries_file) if queries_file else None
 
+        # Set random seeds for reproducibility.
         np.random.seed(self.seed)
         random.seed(self.seed)
+
+        # Create required directories.
         self.workload_dir.mkdir(parents=True, exist_ok=True)
         self.operations_dir = self.workload_dir / "operations"
         self.operations_dir.mkdir(exist_ok=True)
+
         self.n_vectors = self.base_vectors.shape[0]
         self.all_ids = np.arange(self.n_vectors)
         self.resident_set = np.zeros(self.n_vectors, dtype=bool)
@@ -215,32 +229,35 @@ class DynamicWorkloadGenerator:
         self.resident_history: List[np.ndarray] = []
 
     def validate_parameters(self) -> None:
+        """Validate configuration parameters and raise errors if misconfigured."""
         if self.metric not in ["l2", "ip"]:
-            raise ValueError("Metric must be 'l2' or 'ip'.")
-        total = self.insert_ratio + self.delete_ratio + self.query_ratio
-        if not np.isclose(total, 1.0):
+            raise ValueError(f"Invalid metric '{self.metric}'. Must be 'l2' or 'ip'.")
+        total_ratio = self.insert_ratio + self.delete_ratio + self.query_ratio
+        if not np.isclose(total_ratio, 1.0):
             raise ValueError("The sum of insert, delete, and query ratios must equal 1.")
         if self.update_batch_size <= 0 or self.query_batch_size <= 0 or self.num_operations <= 0:
             raise ValueError("Batch sizes and number of operations must be positive.")
         if self.initial_size <= 0 or self.cluster_size <= 0:
             raise ValueError("Initial size and cluster size must be positive.")
-        
         if self.update_sample_distribution not in VALID_SAMPLE_DISTRIBUTIONS:
-            raise ValueError(f"Invalid update sample distribution: {self.update_sample_distribution}. "
-                             f"Valid options are: {VALID_SAMPLE_DISTRIBUTIONS}")
+            raise ValueError(
+                f"Invalid update_sample_distribution '{self.update_sample_distribution}' in config. "
+                f"Valid options are: {', '.join(VALID_SAMPLE_DISTRIBUTIONS)}."
+            )
         if self.query_sample_distribution not in VALID_SAMPLE_DISTRIBUTIONS:
-            raise ValueError(f"Invalid query cluster sample distribution: {self.query_sample_distribution}. "
-                             f"Valid options are: {VALID_SAMPLE_DISTRIBUTIONS}")
+            raise ValueError(
+                f"Invalid query_sample_distribution '{self.query_sample_distribution}' in config. "
+                f"Valid options are: {', '.join(VALID_SAMPLE_DISTRIBUTIONS)}."
+            )
 
-    def initialize_clustered_index(self) -> (np.ndarray, np.ndarray):
+    def initialize_clustered_index(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Clusters the base vectors using Faiss clustering.
-        If a clustering file exists, it is loaded.
+        Cluster the base vectors using Faiss. If a precomputed clustering exists,
+        load it; otherwise, perform clustering and save the results.
 
         Returns:
-          assignments: 1D array of cluster IDs.
-          centroids: 2D array of centroids.
-        The clustering time is recorded.
+            assignments: 1D array of cluster IDs.
+            centroids: 2D array of centroids.
         """
         start_time = time.time()
         if self.initial_clustering_path.exists():
@@ -263,16 +280,21 @@ class DynamicWorkloadGenerator:
             index_centroids.add(centroids)
             _, assignments = index_centroids.search(X, 1)
             assignments = assignments.flatten()
-            np.save(self.initial_clustering_path, {"assignments": assignments, "centroids": centroids})
-            logger.info("Clustering completed and saved to '%s'", self.initial_clustering_path)
+            try:
+                np.save(self.initial_clustering_path, {"assignments": assignments, "centroids": centroids})
+                logger.info("Clustering completed and saved to '%s'", self.initial_clustering_path)
+            except Exception as e:
+                logger.error("Failed to save clustering: %s", e)
         elapsed = time.time() - start_time
         self.runbook["clustering_time"] = elapsed
         logger.info("Clustering elapsed time: %.2f s", elapsed)
         return assignments, centroids
 
     def initialize_workload(self) -> None:
+        """Initialize the workload by setting up clustering and the initial resident set."""
         self.validate_parameters()
         self.assignments, self.centroids = self.initialize_clustered_index()
+        # Setup samplers based on configuration.
         if self.update_sample_distribution in ["clustered_drift", "clustered_random"]:
             self.sampler = StratifiedClusterSampler(self.assignments, self.centroids, self.update_sample_distribution)
         else:
@@ -290,10 +312,13 @@ class DynamicWorkloadGenerator:
         non_resident = self.all_ids[~self.resident_set]
         init_indices = self.sampler.sample(non_resident, self.initial_size)
         self.resident_set[init_indices] = True
+
+        # Save initial indices and vector datasets.
         np.save(self.workload_dir / "initial_indices.npy", init_indices)
         np.save(self.workload_dir / "base_vectors.npy", self.base_vectors)
         if self.queries is not None:
             np.save(self.workload_dir / "query_vectors.npy", self.queries)
+
         self.runbook["parameters"] = {
             "n_base_vectors": self.n_vectors,
             "vector_dimension": self.base_vectors.shape[1],
@@ -314,6 +339,16 @@ class DynamicWorkloadGenerator:
         logger.info("Workload initialization complete. Initial resident set size: %d", int(np.sum(self.resident_set)))
 
     def sample_indices(self, size: int, op_type: str) -> np.ndarray:
+        """
+        Sample indices for a given operation type.
+
+        Parameters:
+            size: Number of indices to sample.
+            op_type: Operation type ("insert", "delete", or "query").
+
+        Returns:
+            Array of sampled indices.
+        """
         if op_type == "insert":
             pool = self.all_ids[~self.resident_set]
         elif op_type == "delete":
@@ -331,34 +366,93 @@ class DynamicWorkloadGenerator:
 
     def compute_ground_truth_for_query(self, q_indices: np.ndarray) -> Dict[str, Any]:
         """
-        Computes ground truth for the queries corresponding to q_indices over the
-        current resident set. Returns a dict with the ground truth time and (optionally)
-        other info.
+        Compute ground truth for the given query indices using the current resident vectors.
+
+        Parameters:
+            q_indices: Indices corresponding to the queries.
+
+        Returns:
+            Dictionary with ground truth computation time and nearest neighbor IDs.
         """
-        # Use the currently resident vectors.
         current_ids = np.where(self.resident_set)[0]
         current_vectors = self.base_vectors[current_ids]
-        # Select the queries for this op.
-        if self.queries is not None:
-            query_vectors = self.queries[q_indices]
-        else:
-            query_vectors = self.base_vectors[q_indices]
+        query_vectors = self.queries[q_indices] if self.queries is not None else self.base_vectors[q_indices]
         d = self.base_vectors.shape[1]
         gt_index = faiss.IndexFlatL2(d) if self.metric == "l2" else faiss.IndexFlatIP(d)
         gt_index.add(current_vectors)
-        start = time.time()
+        start_time = time.time()
         _, gt_ids = gt_index.search(query_vectors.astype(np.float32), GT_K)
-        elapsed = time.time() - start
+        elapsed = time.time() - start_time
         return {"gt_time": elapsed, "gt_ids": gt_ids}
 
+    # --- Helper Functions for Operation Processing ---
+
+    def process_insert(self, op_index: int) -> Optional[Dict[str, Any]]:
+        """Process an insert operation and save the indices."""
+        indices = self.sample_indices(self.update_batch_size, "insert")
+        if indices.size == 0:
+            logger.info("Op %d [INSERT]: No indices available. Skipping generation.", op_index)
+            return None
+        self.resident_set[indices] = True
+        try:
+            np.save(self.operations_dir / f"{op_index}.npy", indices)
+        except Exception as e:
+            logger.error("Failed to save insert op %d: %s", op_index, e)
+            return None
+        return {"operation": "insert",
+                "sample_size": int(indices.size),
+                "n_resident": int(np.sum(self.resident_set))}
+
+    def process_delete(self, op_index: int) -> Optional[Dict[str, Any]]:
+        """Process a delete operation and save the indices."""
+        indices = self.sample_indices(self.update_batch_size, "delete")
+        if indices.size == 0:
+            logger.info("Op %d [DELETE]: No indices available. Terminating generation.", op_index)
+            return None
+        self.resident_set[indices] = False
+        try:
+            np.save(self.operations_dir / f"{op_index}.npy", indices)
+        except Exception as e:
+            logger.error("Failed to save delete op %d: %s", op_index, e)
+            return None
+        return {"operation": "delete",
+                "sample_size": int(indices.size),
+                "n_resident": int(np.sum(self.resident_set))}
+
+    def process_query(self, op_index: int) -> Optional[Dict[str, Any]]:
+        """Process a query operation, compute its ground truth, and save the query indices."""
+        q_indices = self.sample_indices(self.query_batch_size, "query")
+        if q_indices.size == 0:
+            logger.info("Op %d [QUERY]: No query indices available. Terminating generation.", op_index)
+            return None
+        try:
+            np.save(self.operations_dir / f"{op_index}.npy", q_indices)
+        except Exception as e:
+            logger.error("Failed to save query op %d: %s", op_index, e)
+            return None
+        entry = {"operation": "query",
+                 "sample_size": int(q_indices.size),
+                 "n_resident": int(np.sum(self.resident_set))}
+        gt_info = self.compute_ground_truth_for_query(q_indices)
+        entry["gt_time"] = gt_info["gt_time"]
+        return entry
+
+    def update_resident_history(self) -> None:
+        """Update resident history for visualization purposes."""
+        res_ids = self.all_ids[self.resident_set]
+        if res_ids.size > 0:
+            n_clusters = int(self.assignments.max() + 1)
+            counts_arr = np.bincount(self.assignments[res_ids], minlength=n_clusters)
+            # Prevent division by zero with a small constant.
+            fractions = counts_arr / (np.bincount(self.assignments[res_ids], minlength=n_clusters) + 1e-8)
+            self.resident_history.append(fractions)
+
     def generate_workload(self) -> None:
+        """Generate the workload based on the configured parameters."""
         overall_start = time.time()
         self.initialize_workload()
         op_times = {"insert": 0.0, "delete": 0.0, "query": 0.0}
         counts = {"insert": 0, "delete": 0, "query": 0}
-
-        n_clusters = int(self.assignments.max() + 1)
-        cluster_sizes = np.bincount(self.assignments, minlength=n_clusters)
 
         for i in range(self.num_operations):
             op_start = time.time()
@@ -366,42 +460,22 @@ class DynamicWorkloadGenerator:
                 ["insert", "delete", "query"],
                 p=[self.insert_ratio, self.delete_ratio, self.query_ratio]
             )
-            entry: Dict[str, Any] = {}
+
             if op_type == "insert":
-                indices = self.sample_indices(self.update_batch_size, "insert")
-                if indices.size == 0:
-                    logger.info("Op %d [INSERT]: No indices available. Skipping generation.", i)
+                entry = self.process_insert(i)
+                if entry is None:
                     break
-                self.resident_set[indices] = True
                 counts["insert"] += 1
-                entry = {"operation": "insert",
-                         "sample_size": int(indices.size),
-                         "n_resident": int(np.sum(self.resident_set))}
-                np.save(self.operations_dir / f"{i}.npy", indices)
             elif op_type == "delete":
-                indices = self.sample_indices(self.update_batch_size, "delete")
-                if indices.size == 0:
-                    logger.info("Op %d [DELETE]: No indices available. Terminating generation.", i)
+                entry = self.process_delete(i)
+                if entry is None:
                     break
-                self.resident_set[indices] = False
                 counts["delete"] += 1
-                entry = {"operation": "delete",
-                         "sample_size": int(indices.size),
-                         "n_resident": int(np.sum(self.resident_set))}
-                np.save(self.operations_dir / f"{i}.npy", indices)
             elif op_type == "query":
-                q_indices = self.sample_indices(self.query_batch_size, "query")
-                if q_indices.size == 0:
-                    logger.info("Op %d [QUERY]: No query indices available. Terminating generation.", i)
+                entry = self.process_query(i)
+                if entry is None:
                     break
                 counts["query"] += 1
-                entry = {"operation": "query",
-                         "sample_size": int(q_indices.size),
-                         "n_resident": int(np.sum(self.resident_set))}
-                np.save(self.operations_dir / f"{i}.npy", q_indices)
-                # Compute ground truth for this query op.
-                gt_info = self.compute_ground_truth_for_query(q_indices)
-                entry["gt_time"] = gt_info["gt_time"]
             else:
                 raise ValueError(f"Unknown op type: {op_type}")
 
@@ -409,17 +483,13 @@ class DynamicWorkloadGenerator:
             op_elapsed = time.time() - op_start
             op_times[op_type] += op_elapsed
 
+            self.update_resident_history()
 
-            # Compute resident fractions using vectorized operations.
-            res_ids = self.all_ids[self.resident_set]
-            if res_ids.size > 0:
-                counts_arr = np.bincount(self.assignments[res_ids], minlength=n_clusters)
-                fractions = counts_arr / cluster_sizes
-                self.resident_history.append(fractions)
-
-            logger.info("Op %d [%s]: resident_size=%d, sample_size=%d, op_time=%.3f s%s",
-                        i, op_type.upper(), res_ids.shape[0], entry["sample_size"], op_elapsed,
-                        f", gt_time=%.3f s" % entry["gt_time"] if op_type == "query" and "gt_time" in entry else "")
+            log_msg = f"Op {i} [{op_type.upper()}]: resident_size={int(np.sum(self.resident_set))}, " \
+                      f"sample_size={entry.get('sample_size', 0)}, op_time={op_elapsed:.3f} s"
+            if op_type == "query" and "gt_time" in entry:
+                log_msg += f", gt_time={entry['gt_time']:.3f} s"
+            logger.info(log_msg)
 
         total_ops = i + 1
         summary = {
@@ -433,39 +503,20 @@ class DynamicWorkloadGenerator:
         self.runbook["summary"] = summary
         logger.info("Operation timings: %s", summary["average_op_time"])
         logger.info("Operations: %d (insert: %d, delete: %d, query: %d)",
-                    total_ops,
-                    counts["insert"],
-                    counts["delete"],
-                    counts["query"])
+                    total_ops, counts["insert"], counts["delete"], counts["query"])
         logger.info("Total workload generation time: %.2f s", summary["total_generation_time"])
 
-        # Save resident history heatmap.
+        # Save the runbook in JSON format.
         try:
-            import matplotlib.pyplot as plt
-            # Suppress matplotlib debug logs.
-            import logging as mpl_logging
-            mpl_logging.getLogger("matplotlib").setLevel(mpl_logging.WARNING)
-            heatmap = np.array(self.resident_history).T
-            fig, ax = plt.subplots(figsize=(10, 6))
-            cax = ax.imshow(heatmap, cmap="viridis", aspect="auto")
-            ax.set_xlabel("Operation Number")
-            ax.set_ylabel("Cluster ID")
-            fig.colorbar(cax, label="Resident Fraction")
-            plt.tight_layout()
-            heatmap_file = self.workload_dir / "resident_history.png"
-            plt.savefig(heatmap_file)
-            plt.close()
-            logger.info("Resident history heatmap saved to '%s'", heatmap_file)
-        except ImportError:
-            logger.info("matplotlib not installed; skipping resident history plot.")
-
-        runbook_json_path = self.workload_dir / "runbook.json"
-        with runbook_json_path.open("w") as f:
-            json.dump(self.runbook, f, indent=4)
-        logger.info("Runbook saved to '%s'", runbook_json_path)
+            runbook_json_path = self.workload_dir / "runbook.json"
+            with runbook_json_path.open("w") as f:
+                json.dump(self.runbook, f, indent=4)
+            logger.info("Runbook saved to '%s'", runbook_json_path)
+        except Exception as e:
+            logger.error("Failed to save runbook: %s", e)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate dynamic workload runbook using YAML configuration."
     )
@@ -477,9 +528,7 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="[WorkloadGenerator] %(levelname)s: %(message)s"
     )
-    # Suppress unnecessary matplotlib logging.
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
-
     if args.verbose:
         logger.debug("Verbose mode enabled.")
 
@@ -499,10 +548,11 @@ def main():
         initial_size=config.get("initial_size", DEFAULT_INITIAL_SIZE),
         cluster_size=config.get("cluster_size", DEFAULT_CLUSTER_SIZE),
         update_sample_distribution=config.get("update_sample_distribution", DEFAULT_CLUSTER_SAMPLE_DISTRIBUTION),
-        query_sample_distribution=config.get("query_sample_distribution",
-                                                     DEFAULT_QUERY_CLUSTER_SAMPLE_DISTRIBUTION),
+        query_sample_distribution=config.get("query_sample_distribution", DEFAULT_QUERY_CLUSTER_SAMPLE_DISTRIBUTION),
         seed=config.get("seed", DEFAULT_SEED),
         initial_clustering_path=config.get("initial_clustering_path", None),
+        base_vectors_file=config.get("base_vectors_file", None),
+        queries_file=config.get("queries_file", None)
     )
 
     logger.info("Starting workload generation...")

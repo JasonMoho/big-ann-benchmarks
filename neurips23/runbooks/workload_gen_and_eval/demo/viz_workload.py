@@ -139,8 +139,8 @@ def main():
     )
     parser.add_argument("--workload_dir", type=str, required=True,
                         help="Path to the workload directory (must contain base_vectors.npy, initial_indices.npy, runbook.json, operations folder, etc.)")
-    parser.add_argument("--interval", type=int, default=500,
-                        help="Interval between operations in milliseconds.")
+    parser.add_argument("--fps", type=int, default=15,
+                        help="Frames per second for the animation.")
     args = parser.parse_args()
 
     # Load required data.
@@ -196,12 +196,11 @@ def main():
         fargs=(base_vectors, resident_set, query_vectors, operations_dir, op_files,
                scatter_res, scatter_nonres, scatter_query, ax, runbook, active_queries, fade_rate, info_text,
                sim_title),
-        interval=args.interval,
         repeat=False
     )
 
     # save animation
-    ani.save(os.path.join(args.workload_dir, "workload_animation.mp4"), fps=30, extra_args=['-vcodec', 'libx264'])
+    ani.save(os.path.join(args.workload_dir, "workload_animation.mp4"), fps=args.fps, extra_args=['-vcodec', 'libx264'])
     print("Animation saved to {}".format(os.path.join(args.workload_dir, "workload_animation.mp4")))
 
 
