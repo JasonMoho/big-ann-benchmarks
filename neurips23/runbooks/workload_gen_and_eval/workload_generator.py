@@ -423,6 +423,15 @@ class DynamicWorkloadGenerator:
                  "sample_size": int(q_indices.size),
                  "n_resident": int(np.sum(self.resident_set))}
         gt_info = self.compute_ground_truth_for_query(q_indices)
+
+        # save the ground truth IDs for the query operation
+        gt_ids_path = self.operations_dir / f"{op_index}_gt_ids.npy"
+        try:
+            np.save(gt_ids_path, gt_info["gt_ids"])
+        except Exception as e:
+            logger.error("Failed to save ground truth IDs for op %d: %s", op_index, e)
+            return None
+
         entry["gt_time"] = gt_info["gt_time"]
         return entry
 
