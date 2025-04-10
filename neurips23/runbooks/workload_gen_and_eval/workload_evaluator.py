@@ -3,22 +3,24 @@ import os
 import time
 import numpy as np
 import yaml
+import json
 import pickle
 
 from benchmark.algorithms.base_runner import BaseRunner
 from benchmark.datasets import DATASETS
 
-
+from neurips23.streaming.faiss_ivf.faiss_ivf import FaissIVF
+from neurips23.streaming.faiss_flat.faiss_flat import FaissFlat
 def select_index(index_name: str):
-    """
-    Selects and returns an algorithm instance given an index name.
-    This function is intended to interface with BigANN's index selection system.
-    Modify the implementation below to match the repository's actual index factory.
-    """
-    from benchmark.algorithms.index_factory import get_index
-    algo = get_index(index_name)
-    return algo
-
+    if index_name == "faiss-ivf":
+         index_params = {"n_clusters": 50, "k": 10}  # adjust default parameters as needed
+         return FaissIVF(metric="l2", index_params=index_params)
+    elif index_name == "faiss-flat":
+        index_params = {"k": 10}
+        return FaissFlat(metric="l2", index_params=index_params)
+    # other index cases...
+    # For example, if index_name == "scann", return the Scann index, etc.
+    raise ValueError(f"Index '{index_name}' not found in the factory.")
 
 class WorkloadRunner(BaseRunner):
     """
@@ -60,21 +62,36 @@ class WorkloadRunner(BaseRunner):
         """
         t0 = time.time()
         # Load the runbook to extract the dataset name.
-        runbook_path = os.path.join(workload_dir, "runbook.yaml")
+        runbook_path = os.path.join(workload_dir, "runbook.json")
         with open(runbook_path, "r") as f:
-            runbook = yaml.safe_load(f)
-        dataset_name = runbook.get("dataset")
+            runbook = json.load(f)
+        dataset_name = runbook.get("parameters").get("dataset")
         if not dataset_name:
             raise ValueError("Runbook must contain a 'dataset' key to specify the dataset name.")
         ds = DATASETS[dataset_name]()
-        algo.fit(ds)
-        build_time = time.time() - t0
+
+        # get initial resident set
+        initial_indices_path = os.path.join(workload_dir, "initial_indices.npy")
+        if not os.path.exists(initial_indices_path):
+            raise FileNotFoundError(f"Initial indices file not found: {initial_indices_path}")
+
+        initial_indices = np.load(initial_indices_path)
+        initial_vectors = ds.get_dataset()[initial_indices]
+
+        algo.setup(initial_vectors.dtype, -1, initial_vectors.shape[1])
+
         if build_params:
             for key, value in build_params.items():
                 try:
                     setattr(algo, key, value)
                 except Exception as e:
                     print(f"Warning: Could not set build parameter '{key}': {e}")
+
+        print(f"Building index with {initial_vectors.shape[0]} vectors.")
+        algo.insert(initial_vectors, initial_indices)
+        print("Index built.")
+
+        build_time = time.time() - t0
         return build_time
 
     @staticmethod
@@ -100,26 +117,8 @@ class WorkloadRunner(BaseRunner):
         return float(np.mean(recalls))
 
     @classmethod
-    def load_ground_truth(cls, ground_truth_file: str):
-        """
-        Load precomputed ground truth from the specified file.
-        Returns the NumPy array if successful, or None otherwise.
-        """
-        if ground_truth_file and os.path.exists(ground_truth_file):
-            try:
-                gt = np.load(ground_truth_file)
-                print("Ground truth loaded.")
-                return gt
-            except Exception as e:
-                print(f"Warning: Could not load ground truth: {e}")
-                return None
-        else:
-            print("No ground truth file provided or file does not exist.")
-            return None
-
-    @classmethod
     def run_task(cls, algo, workload_dir, distance, k, run_count, search_type,
-                 runbook, search_params=None, ground_truth_file=None, results_dir="results"):
+                 runbook, search_params=None, results_dir="results"):
         """
         Run the workload task by processing each operation in the runbook.
         At the end, save the updated runbook (with timings) in the results directory.
@@ -133,7 +132,6 @@ class WorkloadRunner(BaseRunner):
           search_type: "knn" or "range".
           runbook: List of operation dictionaries from the runbook.
           search_params: Optional dict of attributes to set on algo before searching.
-          ground_truth_file: (Optional) Path to the ground truth .npy file.
           results_dir: Directory where search results and the updated runbook will be saved.
 
         Returns:
@@ -144,41 +142,45 @@ class WorkloadRunner(BaseRunner):
             os.makedirs(results_dir)
 
         # Get dataset name from the runbook and load the dataset.
-        dataset_name = runbook.get("dataset")
+        dataset_name = runbook.get("parameters").get("dataset")
         if not dataset_name:
             raise ValueError("Runbook must include a 'dataset' key with the dataset name.")
         ds = DATASETS[dataset_name]()
         X = ds.get_queries()
+        XB = ds.get_dataset()
+
+        cls.build(algo, workload_dir)
 
         print(f"Got {X.shape[0]} queries")
-        gt = cls.load_ground_truth(ground_truth_file) if ground_truth_file else None
 
         best_search_time = float("inf")
         best_results = None
         search_times = []
 
+        operations = runbook.get("operations", [])
+
         # Process each operation in the runbook.
-        for step, entry in enumerate(runbook.get("operations", [])):
+        for step, op_id in enumerate(operations):
+            entry = operations[op_id]
+            print(step, entry)
             step_start = time.time()
             op = entry.get("operation", "").lower()
+
+            # load operation ids
+            op_file = os.path.join(workload_dir, "operations", f"{op_id}.npy")
+            if not os.path.exists(op_file):
+                raise FileNotFoundError(f"Operation file not found: {op_file}")
+
+            ids = np.load(op_file)
+
             if op == "insert":
-                start_idx = entry["start"]
-                end_idx = entry["end"]
-                data = ds.get_data_in_range(start_idx, end_idx)
-                ids = np.arange(start_idx, end_idx, dtype=np.uint32)
-                algo.insert(data, ids)
+                algo.insert(XB[ids], ids)
             elif op == "delete":
-                start_idx = entry["start"]
-                end_idx = entry["end"]
-                ids = np.arange(start_idx, end_idx, dtype=np.uint32)
                 algo.delete(ids)
             elif op == "replace":
-                ids_start = entry["ids_start"]
-                ids_end = entry["ids_end"]
-                data = ds.get_data_in_range(ids_start, ids_end)
-                tags_to_replace = np.arange(entry["tags_start"], entry["tags_end"], dtype=np.uint32)
-                algo.replace(data, tags_to_replace)
+                raise NotImplementedError("Replace operation is not implemented.")
             elif op == "search":
+                query_vectors = X[ids]
                 if search_params:
                     for key, value in search_params.items():
                         try:
@@ -186,7 +188,7 @@ class WorkloadRunner(BaseRunner):
                         except Exception as e:
                             print(f"Warning: Could not set search parameter '{key}': {e}")
                 if search_type == "knn":
-                    algo.query(X, k)
+                    algo.query(query_vectors, k)
                     results = algo.get_results()  # Expected to return (result_dists, result_ids)
                 elif search_type == "range":
                     algo.range_query(X, k)
@@ -198,6 +200,14 @@ class WorkloadRunner(BaseRunner):
                 result_dists, result_ids = results
                 np.save(os.path.join(results_dir, f"{step}_result_dists.npy"), result_dists)
                 np.save(os.path.join(results_dir, f"{step}_result_ids.npy"), result_ids)
+
+                # check if gt for this operation exists
+                gt_file = os.path.join(workload_dir, "ground_truth", f"{op_id}_gt.npy")
+                if os.path.exists(gt_file):
+                    gt = np.load(gt_file)
+                else:
+                    gt = None
+
                 if gt is not None:
                     try:
                         recall = cls.compute_recall(result_ids, gt[:result_ids.shape[0]], k)
@@ -209,14 +219,14 @@ class WorkloadRunner(BaseRunner):
                     best_search_time = search_time
                     best_results = results
             else:
-                raise NotImplementedError("Invalid runbook operation.")
+                raise NotImplementedError("Invalid runbook operation {}: ".format(op))
             entry["latency"] = time.time() - step_start
             print(f"Step {step + 1} took {time.time() - step_start}s.")
 
         # Save the updated runbook with timings into the results directory.
-        runbook_output_path = os.path.join(results_dir, "runbook_results.yaml")
+        runbook_output_path = os.path.join(results_dir, "runbook_results.json")
         with open(runbook_output_path, "w") as f:
-            yaml.dump(runbook, f)
+            json.dump(runbook, f, indent=4)
         print(f"Updated runbook saved to {runbook_output_path}")
 
         attrs = {
@@ -272,10 +282,6 @@ def main():
         print(f"=== Evaluating index: {index_name} ===")
         # Select the index using our selection function.
         algo = select_index(index_name)
-
-        # Build the algorithm using the workload directory.
-        build_time = WorkloadRunner.build(algo, workload_dir, build_params)
-        print(f"Build time for {index_name}: {build_time:.4f} seconds.")
 
         # Run the workload task.
         attrs, best_results = WorkloadRunner.run_task(

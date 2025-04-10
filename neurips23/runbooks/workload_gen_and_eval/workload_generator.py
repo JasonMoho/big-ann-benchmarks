@@ -167,6 +167,7 @@ class DynamicWorkloadGenerator:
 
     def __init__(
             self,
+            dataset: str,
             workload_dir: Union[str, Path],
             metric: str,
             insert_ratio: float,
@@ -180,11 +181,8 @@ class DynamicWorkloadGenerator:
             update_sample_distribution: str,
             query_sample_distribution: str,
             seed: int,
-            dataset: Optional[str] = None,
-            base_vectors_file: Optional[str] = None,
-            queries_file: Optional[str] = None,
-            initial_clustering_path: Optional[Union[str, Path]] = None,
     ) -> None:
+        self.dataset = dataset
         self.workload_dir = Path(workload_dir)
         self.metric = metric.lower()
         self.insert_ratio = insert_ratio
@@ -199,19 +197,10 @@ class DynamicWorkloadGenerator:
         self.query_sample_distribution = query_sample_distribution.lower()
         self.seed = seed
 
-        if initial_clustering_path:
-            self.initial_clustering_path = Path(initial_clustering_path)
-        else:
-            self.initial_clustering_path = self.workload_dir / "clustered_index.npy"
+        self.initial_clustering_path = self.workload_dir / "clustered_index.npy"
 
         # Load dataset by name or from provided file paths.
-        if dataset:
-            self.base_vectors, self.queries = load_dataset_from_name(dataset)
-        else:
-            if base_vectors_file is None:
-                raise ValueError("Either 'dataset' or 'base_vectors_file' must be provided in the config.")
-            self.base_vectors = np.load(base_vectors_file)
-            self.queries = np.load(queries_file) if queries_file else None
+        self.base_vectors, self.queries = load_dataset_from_name(dataset)
 
         # Set random seeds for reproducibility.
         np.random.seed(self.seed)
@@ -320,6 +309,7 @@ class DynamicWorkloadGenerator:
             np.save(self.workload_dir / "query_vectors.npy", self.queries)
 
         self.runbook["parameters"] = {
+            "dataset": self.dataset,
             "n_base_vectors": self.n_vectors,
             "vector_dimension": self.base_vectors.shape[1],
             "metric": self.metric,
@@ -335,7 +325,6 @@ class DynamicWorkloadGenerator:
             "query_sample_distribution": self.query_sample_distribution,
             "seed": self.seed,
         }
-        self.runbook["initialize"] = {"size": self.initial_size}
         logger.info("Workload initialization complete. Initial resident set size: %d", int(np.sum(self.resident_set)))
 
     def sample_indices(self, size: int, op_type: str) -> np.ndarray:
@@ -344,7 +333,7 @@ class DynamicWorkloadGenerator:
 
         Parameters:
             size: Number of indices to sample.
-            op_type: Operation type ("insert", "delete", or "query").
+            op_type: Operation type ("insert", "delete", or "search").
 
         Returns:
             Array of sampled indices.
@@ -353,7 +342,7 @@ class DynamicWorkloadGenerator:
             pool = self.all_ids[~self.resident_set]
         elif op_type == "delete":
             pool = self.all_ids[self.resident_set]
-        elif op_type == "query":
+        elif op_type == "search":
             pool = np.arange(self.queries.shape[0]) if self.queries is not None else self.all_ids[~self.resident_set]
         else:
             raise ValueError(f"Invalid op type: {op_type}")
@@ -421,7 +410,7 @@ class DynamicWorkloadGenerator:
 
     def process_query(self, op_index: int) -> Optional[Dict[str, Any]]:
         """Process a query operation, compute its ground truth, and save the query indices."""
-        q_indices = self.sample_indices(self.query_batch_size, "query")
+        q_indices = self.sample_indices(self.query_batch_size, "search")
         if q_indices.size == 0:
             logger.info("Op %d [QUERY]: No query indices available. Terminating generation.", op_index)
             return None
@@ -430,7 +419,7 @@ class DynamicWorkloadGenerator:
         except Exception as e:
             logger.error("Failed to save query op %d: %s", op_index, e)
             return None
-        entry = {"operation": "query",
+        entry = {"operation": "search",
                  "sample_size": int(q_indices.size),
                  "n_resident": int(np.sum(self.resident_set))}
         gt_info = self.compute_ground_truth_for_query(q_indices)
@@ -451,13 +440,13 @@ class DynamicWorkloadGenerator:
         """Generate the workload based on the configured parameters."""
         overall_start = time.time()
         self.initialize_workload()
-        op_times = {"insert": 0.0, "delete": 0.0, "query": 0.0}
-        counts = {"insert": 0, "delete": 0, "query": 0}
+        op_times = {"insert": 0.0, "delete": 0.0, "search": 0.0}
+        counts = {"insert": 0, "delete": 0, "search": 0}
 
         for i in range(self.num_operations):
             op_start = time.time()
             op_type = np.random.choice(
-                ["insert", "delete", "query"],
+                ["insert", "delete", "search"],
                 p=[self.insert_ratio, self.delete_ratio, self.query_ratio]
             )
 
@@ -471,11 +460,11 @@ class DynamicWorkloadGenerator:
                 if entry is None:
                     break
                 counts["delete"] += 1
-            elif op_type == "query":
+            elif op_type == "search":
                 entry = self.process_query(i)
                 if entry is None:
                     break
-                counts["query"] += 1
+                counts["search"] += 1
             else:
                 raise ValueError(f"Unknown op type: {op_type}")
 
@@ -487,7 +476,7 @@ class DynamicWorkloadGenerator:
 
             log_msg = f"Op {i} [{op_type.upper()}]: resident_size={int(np.sum(self.resident_set))}, " \
                       f"sample_size={entry.get('sample_size', 0)}, op_time={op_elapsed:.3f} s"
-            if op_type == "query" and "gt_time" in entry:
+            if op_type == "search" and "gt_time" in entry:
                 log_msg += f", gt_time={entry['gt_time']:.3f} s"
             logger.info(log_msg)
 
@@ -495,7 +484,7 @@ class DynamicWorkloadGenerator:
         summary = {
             "n_inserts": counts["insert"],
             "n_deletes": counts["delete"],
-            "n_queries": counts["query"],
+            "n_queries": counts["search"],
             "n_operations": total_ops,
             "average_op_time": {op: (op_times[op] / counts[op] if counts[op] > 0 else 0) for op in op_times},
             "total_generation_time": time.time() - overall_start
@@ -503,7 +492,7 @@ class DynamicWorkloadGenerator:
         self.runbook["summary"] = summary
         logger.info("Operation timings: %s", summary["average_op_time"])
         logger.info("Operations: %d (insert: %d, delete: %d, query: %d)",
-                    total_ops, counts["insert"], counts["delete"], counts["query"])
+                    total_ops, counts["insert"], counts["delete"], counts["search"])
         logger.info("Total workload generation time: %.2f s", summary["total_generation_time"])
 
         # Save the runbook in JSON format.
