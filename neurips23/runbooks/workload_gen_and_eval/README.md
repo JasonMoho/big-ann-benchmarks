@@ -5,16 +5,14 @@
 This project provides two key modules for streaming benchmarks on vector search datasets:
 	
 1.	Dynamic Workload Generator
-   - Generates a series of operations (insert, delete, query) on a vector dataset.
+   - Generates a series of operations (insert, delete, query) by sampling from a given dataset.
    - Supports loading datasets by name (using benchmark.datasets) or from user-specified files.
-   - Applies Faiss clustering to the base vectors to create a stratified initial resident set and guide sampling.
-   - Saves each operation as a separate .npy file inside an operations folder.
-   - Logs timings, computes ground truth (using Faiss), and records a detailed runbook (in both JSON and YAML) with all operation metrics.
+   - Uses faiss to cluster to the base vectors to allow for sampling using clusters.
+   - Logs timings, computes ground truth (using Faiss), and records runbook with all operation metrics.
 	
 2.	Streaming Workload Evaluator
-- Reads the runbook generated above and processes the operations using an index.
-- Builds a default Faiss Flat index (if no external index is provided) or uses a supplied index.
-- Computes or loads exhaustive ground truth for query vectors and evaluates recall and latency for query operations.
+- Reads the runbook generated above and processes the operations for an index.
+- Records recall and latency for each operatios, saving result ids and distances for queries and saving timing info into an output runbook.
 
 ⸻
 
@@ -100,11 +98,8 @@ The following table summarizes the key configuration parameters for both modules
 | workload_dir       | string  | N/A     | Any valid directory containing workload files | Directory where the runbook, operations, and vector data are stored.                                |
 | metric             | string  | "l2"    | "l2", "ip"                             | The metric used by Faiss for indexing and search operations.                                        |
 | k                  | integer | 10      | Must be a positive integer              | Number of nearest neighbors to retrieve per query.                                                 |
-| use_gpu            | boolean | false   | true or false                           | Indicates whether to use GPU resources for Faiss (requires GPU support and proper drivers).         |
-| use_precomputed_gt | boolean | true    | true or false                           | Whether to load precomputed ground truth, if available, to speed up evaluation.                     |
 
 ⸻
-
 ## Usage
 
 ### Running the Workload Generator
@@ -114,7 +109,7 @@ Follow the format above to specify your dataset (or provide file paths), ratios,
 ### 2. Execute the generator
 
 ```bash
-python neurips23/streaming/workload_generator.py --config config.yaml [--verbose]
+python3 -m neurips23.streaming.workload_generator --config config.yaml [--verbose]
 ```
 
 With --verbose, detailed debug logging will be enabled.
@@ -128,10 +123,11 @@ With --verbose, detailed debug logging will be enabled.
 #### 1.	Prepare the evaluation configuration file (e.g., eval_config.yaml)
 Specify the workload directory and search_parameters
 
-#### 2. Execute the evaluator:
+#### 2. Execute the evaluator :
 
+Run from the repo root
 ```bash
-python neurips23/streaming/workload_evaluator.py --config eval_config.yaml
+python3 -m neurips23.streaming.workload_evaluator --config eval_config.yaml
 ```
 The evaluator processes each operation—updates the index, runs queries, and computes recall against the ground truth.
 
